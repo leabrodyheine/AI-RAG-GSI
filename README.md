@@ -259,17 +259,31 @@ this prototype rather than a backend change.
   authority) still cites `ORS 536.740` normally. `ANSWER_BACKEND=ollama` with no local
   Ollama server installed fails with the documented clear error via both `orswater ask`
   and `POST /api/ask` (curled directly, confirmed HTTP 503 with that message) -- no live
-  Ollama request was made anywhere in this round, since Ollama isn't installed on this
-  machine.
+  Ollama request was made anywhere in this round -- Ollama wasn't installed on this
+  machine yet at the time.
+- **Follow-up, later the same day:** installed Ollama (`brew install ollama`), started it
+  (`brew services start ollama`), pulled the default model (`ollama pull llama3.2:3b`,
+  confirmed via `ollama list`), set `ANSWER_BACKEND=ollama` in `.env` (gitignored, never
+  committed), and restarted the server. Two real, live `POST /api/ask` calls against the
+  actual local model: a citation-in-question query ("What does ORS 537.545 say about
+  exempt uses?") correctly cited `ORS 537.545` with the real verbatim excerpt and
+  volunteered its own "not legal advice" line unprompted; a phrased-like-a-person query
+  ("Can I dig a well on my property without a permit?") got a substantive, accurate-
+  reading answer but **zero citations**, because the model referenced real ORS numbers
+  (537.545, 537.505, 537.795) that happened not to be among the 8 sections actually
+  retrieved for that query -- `_extract_cited_sections` correctly dropped them rather than
+  showing them as sources, exactly as designed, but it's a real, observed instance of the
+  local model not reliably grounding its answer in only the context it was given. Full
+  suite re-run afterward: `pytest` still 59/59, `ruff check .` still clean.
 
 **Limitations added this round:**
 
-- The `ollama` backend has never actually been run against a real Ollama server on this
-  machine (Ollama isn't installed here) -- it's verified via `httpx.MockTransport` (real
-  request/response shapes, no network) and a real connection-refused error path, not a
-  real end-to-end generation. Anyone using it should expect to debug real-model quirks
-  (formatting, occasionally ignoring the "say so when the sections don't answer" rule)
-  that a mocked test can't catch.
+- The `ollama` backend's *code paths* (request shape, error handling, citation
+  extraction) are covered by tests via `httpx.MockTransport`; its *output quality* was
+  spot-checked with two live questions against `llama3.2:3b` (above), not systematically
+  evaluated the way retrieval was in M4. The one non-trivial question tried came back
+  with no citations at all despite a plausible-looking answer -- expect to see that
+  fairly often with a 3B local model, not as a rare edge case.
 - `WEAK_MATCH_DISTANCE` is a single global cutoff tuned against this specific corpus and
   embedding model; it would need recalibrating against real distances if the corpus,
   embedding model, or domain changes.
