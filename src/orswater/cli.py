@@ -4,8 +4,9 @@ Usage:
     orswater ask "<question>" [--groups g1,g2]
 
 The answer backend is chosen by the ANSWER_BACKEND env var ("deterministic", the
-default -- no API key needed, or "anthropic" -- requires a real ANTHROPIC_API_KEY). See
-.env.example and the README.
+default -- no API key or model needed; "ollama" -- requires a running local Ollama
+server; or "anthropic" -- requires a real ANTHROPIC_API_KEY). See .env.example and the
+README.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .answer import MissingAnthropicCredentialsError, answer
+from .answer import MissingAnthropicCredentialsError, OllamaUnavailableError, answer
 from .db import connect
 
 
@@ -21,7 +22,7 @@ def _run_ask(question: str, groups: list[str]) -> int:
     conn = connect()
     try:
         result = answer(conn, question, groups)
-    except MissingAnthropicCredentialsError as e:
+    except (MissingAnthropicCredentialsError, OllamaUnavailableError) as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         return 1
     finally:
@@ -50,7 +51,8 @@ def main(argv: list[str] | None = None) -> int:
         prog="orswater",
         description=(
             "Answer backend is set by the ANSWER_BACKEND env var: 'deterministic' "
-            "(default, no API key needed) or 'anthropic' (requires ANTHROPIC_API_KEY)."
+            "(default, no API key or model needed), 'ollama' (requires a running local "
+            "Ollama server), or 'anthropic' (requires ANTHROPIC_API_KEY)."
         ),
     )
     subparsers = parser.add_subparsers(dest="command")

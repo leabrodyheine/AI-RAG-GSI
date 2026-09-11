@@ -1,8 +1,13 @@
 """Tests for orswater.answer.
 
-Covers both answer backends:
+Covers all three answer backends:
 - ``deterministic`` (the default -- must work with ANTHROPIC_API_KEY unset, must never
   construct or call an Anthropic client).
+- ``ollama`` (opt-in via ANSWER_BACKEND=ollama) -- an httpx.MockTransport stands in for a
+  real Ollama server, so these run with no network access and no local model installed.
+  They check the request shape (system prompt, formatted sections, no tools) and the
+  citation-extraction/invented-section-filtering logic, not that any particular model's
+  output looks a certain way. No real Ollama request is ever made by this file.
 - ``anthropic`` (opt-in via ANSWER_BACKEND=anthropic) -- a fake Anthropic client stands
   in for the real SDK client so these run with no network access and no API key; they
   check that we build the search_result request blocks correctly and map the response's
@@ -12,12 +17,14 @@ Covers both answer backends:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
+import httpx
 import pytest
 
 import orswater.answer as answer_module
-from orswater.answer import MissingAnthropicCredentialsError, answer
+from orswater.answer import MissingAnthropicCredentialsError, OllamaUnavailableError, answer
 from orswater.config import load_config
 from orswater.search import Result
 
@@ -80,6 +87,19 @@ def test_invalid_answer_backend_value_fails_clearly(monkeypatch):
     monkeypatch.setenv("ANSWER_BACKEND", "bogus")
     with pytest.raises(ValueError, match="ANSWER_BACKEND"):
         load_config()
+
+
+def test_ollama_backend_is_a_valid_answer_backend_value(monkeypatch):
+    monkeypatch.setenv("ANSWER_BACKEND", "ollama")
+    assert load_config().answer_backend == "ollama"
+
+
+def test_ollama_host_and_model_have_sane_defaults(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+    config = load_config()
+    assert config.ollama_host == "http://localhost:11434"
+    assert config.ollama_model  # some non-empty default model tag
 
 
 @pytest.mark.parametrize(
@@ -216,6 +236,185 @@ def test_deterministic_backend_reports_no_confident_match_for_a_real_off_topic_q
     assert "no excerpt is being quoted" in result.text.lower()
     assert "not legal advice" in result.text.lower()
     assert len(result.retrieved_sections) >= 1  # still surfaced, just not cited as an answer
+
+
+# ---------------------------------------------------------------------------
+# Ollama backend: opt-in, direct HTTP via httpx.MockTransport (no SDK, no real server)
+# ---------------------------------------------------------------------------
+
+
+def _mock_ollama_client(handler) -> httpx.Client:
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_ollama_backend_sends_the_system_prompt_and_formatted_sections_with_no_tools(
+    db_conn, monkeypatch
+):
+    monkeypatch.setenv("ANSWER_BACKEND", "ollama")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = request.url
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"message": {"content": "Yes, per ORS 537.545."}})
+
+    result = answer(
+        db_conn,
+        "What does ORS 537.545 say about exempt uses?",
+        [],
+        ollama_client=_mock_ollama_client(handler),
+    )
+
+    assert result.backend == "ollama"
+    assert str(captured["url"]) == "http://localhost:11434/api/chat"
+
+    body = captured["body"]
+    assert "tools" not in body  # the model must get no tools
+    assert body["stream"] is False
+    assert body["messages"][0] == {"role": "system", "content": answer_module.SYSTEM_PROMPT}
+    assert "537.545" in body["messages"][1]["content"]
+    assert "registration" in body["messages"][1]["content"]  # real 537.545 body text
+
+
+def test_ollama_backend_returns_the_models_answer_text(db_conn, monkeypatch):
+    monkeypatch.setenv("ANSWER_BACKEND", "ollama")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": {"content": "Yes, per ORS 537.545."}})
+
+    result = answer(
+        db_conn,
+        "What does ORS 537.545 say about exempt uses?",
+        [],
+        ollama_client=_mock_ollama_client(handler),
+    )
+    assert result.text == "Yes, per ORS 537.545."
+
+
+def test_ollama_backend_drops_a_citation_the_model_invented(db_conn, monkeypatch):
+    """The invented-section-filtering requirement: a section number the model mentions
+    that wasn't actually retrieved must not be shown as a source."""
+    monkeypatch.setenv("ANSWER_BACKEND", "ollama")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # search() returns only 537.545 for this citation-in-question query -- 538.200
+        # was never retrieved, so it must not survive as a citation even though it's
+        # mentioned in the model's answer and in-range for the CITATION_RE regex.
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": "See ORS 537.545 and, relatedly, ORS 538.200 (not provided)."
+                }
+            },
+        )
+
+    result = answer(
+        db_conn,
+        "What does ORS 537.545 say about exempt uses?",
+        [],
+        ollama_client=_mock_ollama_client(handler),
+    )
+
+    assert len(result.citations) == 1
+    assert result.citations[0].section_number == "537.545"
+
+
+def test_ollama_backend_dedups_repeated_mentions_of_the_same_section(db_conn, monkeypatch):
+    monkeypatch.setenv("ANSWER_BACKEND", "ollama")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"message": {"content": "ORS 537.545 covers this. As ORS 537.545 says..."}},
+        )
+
+    result = answer(
+        db_conn,
+        "What does ORS 537.545 say about exempt uses?",
+        [],
+        ollama_client=_mock_ollama_client(handler),
+    )
+    assert len(result.citations) == 1
+
+
+def test_ollama_backend_raises_a_clear_error_when_the_server_is_unreachable(db_conn, monkeypatch):
+    monkeypatch.setenv("ANSWER_BACKEND", "ollama")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(OllamaUnavailableError, match="ollama serve"):
+        answer(
+            db_conn,
+            "What does ORS 537.545 say about exempt uses?",
+            [],
+            ollama_client=_mock_ollama_client(handler),
+        )
+
+
+def test_ollama_backend_raises_a_clear_error_when_the_model_is_not_pulled(db_conn, monkeypatch):
+    monkeypatch.setenv("ANSWER_BACKEND", "ollama")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text='{"error":"model not found"}')
+
+    with pytest.raises(OllamaUnavailableError, match="pull"):
+        answer(
+            db_conn,
+            "What does ORS 537.545 say about exempt uses?",
+            [],
+            ollama_client=_mock_ollama_client(handler),
+        )
+
+
+def test_ollama_backend_skips_the_http_call_when_nothing_is_retrieved(db_conn, monkeypatch):
+    monkeypatch.setenv("ANSWER_BACKEND", "ollama")
+    db_conn.execute("DELETE FROM sections")  # rolled back by the db_conn fixture afterward
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"message": {"content": "unreachable"}})
+
+    result = answer(db_conn, "Can I dig a well?", [], ollama_client=_mock_ollama_client(handler))
+
+    assert result.text.startswith("No ORS sections")
+    assert result.citations == []
+    assert calls == []  # no HTTP call made when there's nothing to answer from
+
+
+# Pure unit tests of the citation-extraction/invented-section-filtering logic in
+# isolation, per the working rule that these must be testable with no running model.
+
+
+def test_extract_cited_sections_keeps_a_citation_to_a_retrieved_section():
+    retrieved = [_fake_result(section_number="537.130", distance=0.1)]
+    citations = answer_module._extract_cited_sections(
+        "Under ORS 537.130, you generally need a permit.", retrieved
+    )
+    assert len(citations) == 1
+    assert citations[0].section_number == "537.130"
+
+
+def test_extract_cited_sections_drops_a_citation_the_model_invented():
+    retrieved = [_fake_result(section_number="537.130", distance=0.1)]
+    citations = answer_module._extract_cited_sections(
+        "Under ORS 538.999, you generally need a permit.", retrieved
+    )
+    assert citations == []
+
+
+def test_extract_cited_sections_preserves_first_mention_order():
+    retrieved = [
+        _fake_result(section_number="537.130", distance=0.1),
+        _fake_result(section_number="537.545", distance=0.1),
+    ]
+    citations = answer_module._extract_cited_sections(
+        "First see ORS 537.545, then ORS 537.130.", retrieved
+    )
+    assert [c.section_number for c in citations] == ["537.545", "537.130"]
 
 
 # ---------------------------------------------------------------------------

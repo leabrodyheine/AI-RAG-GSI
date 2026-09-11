@@ -82,6 +82,11 @@ h1 {
   color: #5b21b6;
 }
 
+.backend-ollama {
+  background: #fef3c7;
+  color: #92400e;
+}
+
 .answer-text {
   white-space: pre-wrap;
   line-height: 1.5;

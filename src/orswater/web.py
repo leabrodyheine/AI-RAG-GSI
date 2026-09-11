@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .answer import MissingAnthropicCredentialsError, answer
+from .answer import MissingAnthropicCredentialsError, OllamaUnavailableError, answer
 from .db import connect
 
 app = FastAPI(title="Oregon Water Law RAG")
@@ -54,9 +54,10 @@ def ask(req: AskRequest) -> AskResponse:
     conn = connect()
     try:
         result = answer(conn, req.question, req.groups)
-    except MissingAnthropicCredentialsError as e:
-        # A configuration problem (ANSWER_BACKEND=anthropic with no real key), not a
-        # question the statutes don't answer -- 503 rather than a normal answer payload.
+    except (MissingAnthropicCredentialsError, OllamaUnavailableError) as e:
+        # A configuration problem (ANSWER_BACKEND=anthropic with no real key, or
+        # ANSWER_BACKEND=ollama with no reachable server), not a question the statutes
+        # don't answer -- 503 rather than a normal answer payload.
         raise HTTPException(status_code=503, detail=str(e)) from e
     finally:
         conn.close()

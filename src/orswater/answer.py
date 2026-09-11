@@ -1,18 +1,27 @@
 """``answer(conn, question, user_groups)`` -- retrieves via search() and produces an
-answer, using one of two backends selected by the ``ANSWER_BACKEND`` env var:
+answer, using one of three backends selected by the ``ANSWER_BACKEND`` env var:
 
 - ``deterministic`` (the default): no model, no API call, no network access at all --
   just a bounded verbatim excerpt of the highest-ranked retrieved section. This is what
   lets the whole prototype (ingest, search, evaluate, answer) run end to end with no
-  Anthropic API key.
+  Anthropic API key and no local model, and is a superset of what the original spec's
+  free/dev-mode backend needed (it never sends anything anywhere at all).
+- ``ollama``: a local open-weight model via the Ollama REST API (no SDK -- direct HTTP,
+  per the Ollama docs). Free, local, but slower and less reliable than Claude, and has no
+  structured citation mechanism: the retrieved sections are formatted into the prompt as a
+  numbered list, and citations are recovered afterward by scanning the model's answer text
+  for ORS section numbers and keeping only the ones that were actually retrieved (a number
+  the model invented, or one outside the retrieved set, is dropped rather than shown as a
+  source -- see _extract_cited_sections).
 - ``anthropic``: sends the retrieved sections to Claude as ``search_result`` content
   blocks with citations enabled (the SDK's citations feature, verified against the
   installed anthropic SDK -- no beta header, no tool). Claude is given no tools: it
   cannot browse the web or write files, only answer from the sections it was handed.
   Only opted into explicitly -- ANTHROPIC_API_KEY existing is never enough by itself.
 
-Document text only ever goes to Claude when the anthropic backend is explicitly selected;
-the deterministic backend never sends anything anywhere.
+Document text goes to Ollama (a local process) when that backend is selected, and to
+Claude only when the anthropic backend is explicitly selected; the deterministic backend
+never sends anything anywhere.
 """
 
 from __future__ import annotations
@@ -21,10 +30,11 @@ import re
 from dataclasses import dataclass
 
 import anthropic
+import httpx
 import psycopg
 
 from .config import Config, load_config
-from .search import Result, search
+from .search import CITATION_RE, Result, search
 
 SYSTEM_PROMPT = """You answer questions about Oregon water law using ONLY the ORS (Oregon \
 Revised Statutes) sections provided to you as search results in this conversation.
@@ -67,9 +77,19 @@ _SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 # citation is inherently a confident match).
 WEAK_MATCH_DISTANCE = 0.40
 
+# Local generation on CPU can be slow, especially the first call after the model is
+# loaded into memory -- long enough to be generous, short enough to fail rather than hang
+# forever if the server is stuck.
+OLLAMA_TIMEOUT_SECONDS = 120.0
+
 
 class MissingAnthropicCredentialsError(RuntimeError):
     """ANSWER_BACKEND=anthropic was selected but no usable ANTHROPIC_API_KEY is set."""
+
+
+class OllamaUnavailableError(RuntimeError):
+    """ANSWER_BACKEND=ollama was selected but the Ollama server isn't reachable, or
+    rejected the request (e.g. the configured model hasn't been pulled)."""
 
 
 @dataclass(frozen=True)
@@ -148,6 +168,88 @@ def _deterministic_answer(retrieved: list[Result]) -> Answer:
     )
 
 
+def _format_ollama_sections(retrieved: list[Result]) -> str:
+    """A numbered list of section number, heading, and full text -- what the model sees.
+    Unlike the anthropic backend's search_result blocks, Ollama has no structured citation
+    mechanism, so the section numbers are spelled out directly in the prompt text and
+    recovered afterward by scanning the model's answer (_extract_cited_sections)."""
+    return "\n\n".join(
+        f"{i}. ORS {r.section_number} — {r.heading}\n{r.text}" for i, r in enumerate(retrieved, start=1)
+    )
+
+
+def _extract_cited_sections(text: str, retrieved: list[Result]) -> list[Citation]:
+    """Scan a free-text model answer for ORS section numbers and keep only the ones that
+    were actually retrieved, in first-mention order with duplicates dropped. This is
+    Ollama's only citation mechanism (no structured citation data like the anthropic
+    backend gets) -- a number the model invented, or one outside the retrieved set, is
+    dropped rather than shown as if it were a real source."""
+    retrieved_by_number = {r.section_number: r for r in retrieved}
+    seen: set[str] = set()
+    citations: list[Citation] = []
+    for match in CITATION_RE.finditer(text):
+        section_number = f"{match.group(1)}.{match.group(2)}"
+        if section_number in seen or section_number not in retrieved_by_number:
+            continue
+        seen.add(section_number)
+        section = retrieved_by_number[section_number]
+        citations.append(
+            Citation(
+                section_number=section.section_number,
+                heading=section.heading,
+                cited_text=_bounded_excerpt(section.text),
+            )
+        )
+    return citations
+
+
+def _ollama_answer(
+    retrieved: list[Result],
+    question: str,
+    config: Config,
+    *,
+    http_client: httpx.Client | None = None,
+) -> Answer:
+    owns_client = http_client is None
+    client = http_client or httpx.Client(timeout=OLLAMA_TIMEOUT_SECONDS)
+    user_content = f"{_format_ollama_sections(retrieved)}\n\nQuestion: {question}"
+
+    try:
+        response = client.post(
+            f"{config.ollama_host}/api/chat",
+            json={
+                "model": config.ollama_model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                "stream": False,
+            },
+        )
+        response.raise_for_status()
+    except httpx.ConnectError as e:
+        raise OllamaUnavailableError(
+            f"ANSWER_BACKEND=ollama requires a running Ollama server at {config.ollama_host}, "
+            "but it isn't reachable. Install it (https://ollama.com/download), start it "
+            f"(`ollama serve`), and pull the configured model (`ollama pull "
+            f"{config.ollama_model}`) -- or unset ANSWER_BACKEND (or set it to "
+            "'deterministic') to use the no-dependency prototype backend instead."
+        ) from e
+    except httpx.HTTPStatusError as e:
+        raise OllamaUnavailableError(
+            f"Ollama at {config.ollama_host} rejected the request ({e.response.status_code}): "
+            f"{e.response.text.strip()}. If {config.ollama_model!r} hasn't been pulled yet, "
+            f"run `ollama pull {config.ollama_model}`."
+        ) from e
+    finally:
+        if owns_client:
+            client.close()
+
+    text = response.json()["message"]["content"]
+    citations = _extract_cited_sections(text, retrieved)
+    return Answer(text=text, citations=citations, retrieved_sections=retrieved, backend="ollama")
+
+
 def _to_search_result_block(result: Result) -> dict:
     return {
         "type": "search_result",
@@ -221,13 +323,16 @@ def answer(
     user_groups: list[str],
     *,
     client: anthropic.Anthropic | None = None,
+    ollama_client: httpx.Client | None = None,
 ) -> Answer:
     """Retrieve relevant sections and answer from them using the configured backend.
 
     Backend is chosen by the ``ANSWER_BACKEND`` env var (``deterministic`` by default;
-    ``anthropic`` must be set explicitly -- having ANTHROPIC_API_KEY set is never enough
-    by itself). ``client`` can be injected for testing the anthropic backend; otherwise
-    one is built from ANTHROPIC_API_KEY when that backend is selected.
+    ``ollama`` and ``anthropic`` must be set explicitly -- having ANTHROPIC_API_KEY set is
+    never enough by itself). ``client`` can be injected for testing the anthropic backend
+    and ``ollama_client`` for testing the ollama backend (an httpx.Client, e.g. built with
+    a MockTransport); otherwise real ones are built from config when those backends are
+    selected.
     """
     config = load_config()
     retrieved = search(conn, question, user_groups)
@@ -242,4 +347,6 @@ def answer(
 
     if config.answer_backend == "deterministic":
         return _deterministic_answer(retrieved)
+    if config.answer_backend == "ollama":
+        return _ollama_answer(retrieved, question, config, http_client=ollama_client)
     return _anthropic_answer(retrieved, question, config, client=client)

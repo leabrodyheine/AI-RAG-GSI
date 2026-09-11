@@ -26,7 +26,7 @@ Build a small, working RAG prototype that answers questions about Oregon water l
 - Don't log full prompts or retrieved text by default.
 - Claude gets no tools: no web access, no file writes. Read-only question answering.
 - API key comes from the `ANTHROPIC_API_KEY` env var; model from `ANTHROPIC_MODEL`, defaulting to `claude-sonnet-5`. Provide `.env.example`.
-- The answer step has two backends, chosen by `ANSWER_BACKEND` (default `deterministic`): `deterministic` needs no API key and makes no external call at all (a bounded verbatim excerpt of the top retrieved section); `anthropic` is opted into explicitly and sends retrieved sections to Claude. Having `ANTHROPIC_API_KEY` set never selects `anthropic` by itself.
+- The answer step has three backends, chosen by `ANSWER_BACKEND` (default `deterministic`): `deterministic` needs no API key, model, or network call at all (a bounded verbatim excerpt of the top retrieved section); `ollama` sends retrieved sections to a local open-weight model over the Ollama REST API (free, but requires Ollama installed and running); `anthropic` is opted into explicitly and sends retrieved sections to Claude for a paid, more reliable cited answer. Having `ANTHROPIC_API_KEY` set never selects `anthropic` by itself, and `ollama`/`anthropic` are both explicit opt-ins over the zero-dependency `deterministic` default.
 
 **Schema:** one `sections` table with section_number (unique, e.g. "537.130"), chapter, heading, text, source_url, edition (read from the page), allowed_groups (text array, empty = public), embedding (vector), and a generated tsvector column. Add an HNSW index on the embedding and a GIN index on the tsvector.
 
@@ -101,9 +101,16 @@ from Hugging Face the first time it's used and cached afterward, so the very fir
 ingest or search does need network access for that one-time download, not for anything
 document-related.
 
-Set `ANSWER_BACKEND=anthropic` in `.env` only if you want natural-language cited answers
-from Claude instead of the deterministic backend's verbatim excerpt. That's opt-in,
-requires a real `ANTHROPIC_API_KEY` (from
+Set `ANSWER_BACKEND=ollama` in `.env` for a free natural-language cited answer from a
+local model instead of the deterministic backend's verbatim excerpt -- requires
+[Ollama](https://ollama.com/download) installed and running (`ollama serve`) with the
+configured model pulled (`ollama pull llama3.2:3b`, the default `OLLAMA_MODEL`). No API
+key, no cost, but slower than Claude and less reliable at following the citation
+instructions (its citations come from scanning its answer text for section numbers and
+keeping only ones that were actually retrieved, not a structured citation API).
+
+Set `ANSWER_BACKEND=anthropic` in `.env` if you want natural-language cited answers from
+Claude instead. That's opt-in, requires a real `ANTHROPIC_API_KEY` (from
 [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)), and
 incurs Anthropic API usage costs.
 
@@ -113,11 +120,11 @@ incurs Anthropic API usage costs.
 | --- | --- |
 | `sql/schema.sql` | the single `sections` table + HNSW and GIN indexes |
 | `docker-compose.yml` | Postgres 17 with the pgvector extension |
-| `src/orswater/config.py` | env config (`ANSWER_BACKEND`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `DATABASE_URL`) |
+| `src/orswater/config.py` | env config (`ANSWER_BACKEND`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `DATABASE_URL`) |
 | `src/orswater/db.py` | psycopg connection + schema setup |
 | `src/orswater/fetch.py` / `parse.py` / `embed.py` / `ingest.py` | ingestion pipeline (M2) |
-| `src/orswater/search.py` | `search(question, user_groups)` — the swappable retrieval seam (M3) |
-| `src/orswater/answer.py` | `answer()` — deterministic (default, no API key) or Claude-with-citations backend, chosen by `ANSWER_BACKEND` (M5) |
+| `src/orswater/search.py` | `search(question, user_groups)` — the swappable retrieval seam (M3); each result also carries the embedding distance used by the deterministic backend's relevance threshold |
+| `src/orswater/answer.py` | `answer()` — deterministic (default, no API key), local-Ollama, or Claude-with-citations backend, chosen by `ANSWER_BACKEND` (M5) |
 | `src/orswater/web.py` | FastAPI JSON API (`POST /api/ask`), serves the built frontend as static files (M6) |
 | `web/` | React + TypeScript frontend (Vite), built separately -- `web/src/App.tsx` (markup/logic), `web/src/App.css` (styles), `web/src/api.ts` + `web/src/types.ts` (typed API client) (M6) |
 | `evals/` | retrieval evaluation set + report script (M4) |
@@ -186,3 +193,83 @@ is what `web.py` serves as static files; it's gitignored, same as `web/node_modu
 - Inline citation highlighting within the answer text itself wasn't built; citations are
   shown as a separate list under the answer rather than as inline markers, which keeps the
   UI simple but doesn't visually tie a specific sentence in the answer to its source.
+
+## Follow-up: Ollama backend, relevance threshold, disclaimer UI (post-M6)
+
+Three changes made after the initial six milestones, in response to feedback on the
+running prototype.
+
+**1. Added the `ollama` answer backend.** The original spec called for a free local-model
+backend as the two the answer step supports; only `deterministic` (no model at all) and
+`anthropic` had been built. `ollama` now fills that gap: retrieved sections are formatted
+into a numbered list in the prompt (no structured citation mechanism like Claude's
+`search_result` blocks exists for it), sent to a local Ollama server over its REST API
+(`POST /api/chat`, no SDK, no beta header -- confirmed against the current Ollama docs),
+and citations are recovered by scanning the model's answer text for ORS section numbers
+and keeping only ones that were actually retrieved (`_extract_cited_sections` in
+`answer.py`) -- a number the model invents, or one outside the retrieved set, is dropped
+rather than shown as a real source. Default model is `llama3.2:3b` (~2GB, runs on CPU,
+reliable enough at following the system prompt's citation instructions for a prototype;
+see `config.py` for the tradeoff note against the larger, paid, more reliable Claude
+backend). Selecting `ANSWER_BACKEND=ollama` with no reachable server fails clearly with
+install/run instructions (`OllamaUnavailableError`), both from the CLI and as an HTTP 503
+from the web API, rather than hanging or failing mid-question.
+
+**2. Added a relevance threshold to the deterministic backend.** Previously the
+deterministic backend always quoted the single top-ranked retrieved section, even for
+questions entirely unrelated to Oregon water law (e.g. "What is the speed limit on I-5?"),
+since vector search ranks by distance rather than applying a cutoff -- there being no LLM
+in that backend to judge whether the retrieved text actually answers the question. Fixed
+by threading each result's cosine distance from `search()` (`Result.distance`, `None` for
+a direct ORS-citation match, which is exact by construction) into a calibrated
+`WEAK_MATCH_DISTANCE = 0.40` cutoff in `answer.py`: above it, the response says plainly
+that nothing retrieved looks like a close match instead of quoting the nearest section as
+if it were the answer. The cutoff was calibrated against the real distances of all 25
+`evals/questions.jsonl` questions (max: 0.328) and several deliberately off-topic
+questions (0.40–0.59), leaving margin on both sides; it won't catch every off-topic or
+domain-adjacent question, and this doesn't apply to the `ollama`/`anthropic` backends,
+which judge relevance with an actual model instead. `search()`'s own retrieval/ranking is
+unchanged by this -- confirmed by re-running `scripts/eval_retrieval.py` (still 22/25,
+88%, identical misses).
+
+**3. Hid the "not legal advice" disclaimer in the web UI only.** The backend text
+(`answer.py`'s `LEGAL_DISCLAIMER`), the CLI output, and this README's requirement for one
+are all unchanged -- a real deployment still needs it, and the spec explicitly calls for
+"a visible 'not legal advice' note." The React app now strips that exact string from what
+it displays (`web/src/App.tsx`'s `withoutDisclaimer`), a UI-only presentation choice for
+this prototype rather than a backend change.
+
+**Checks actually run for this round:**
+
+- `pytest`: **59/59 passed** (12 new: 2 config tests for the `ollama` backend value and
+  its `OLLAMA_HOST`/`OLLAMA_MODEL` defaults, 7 covering the ollama backend end-to-end via
+  `httpx.MockTransport` -- request shape, no tools, invented-citation filtering, dedup,
+  unreachable-server and model-not-pulled errors, skipping the HTTP call on empty
+  retrieval -- 3 pure unit tests of `_extract_cited_sections`, plus the relevance-threshold
+  tests from the prior round).
+- `ruff check .`: **all checks passed**.
+- `scripts/eval_retrieval.py`: **22/25, 88%**, unchanged from before the `Result.distance`
+  refactor (confirms retrieval itself wasn't altered, only what the deterministic backend
+  says about a weak match).
+- `cd web && npm run build`: `tsc --noEmit` and the Vite production build both
+  **succeeded**.
+- Live, end-to-end, by hand: `POST /api/ask` for "What is the speed limit on I-5?" now
+  returns the no-confident-match text with no citation (previously quoted an unrelated
+  section); `POST /api/ask` for an on-topic question (governor's drought-declaration
+  authority) still cites `ORS 536.740` normally. `ANSWER_BACKEND=ollama` with no local
+  Ollama server installed fails with the documented clear error via both `orswater ask`
+  and `POST /api/ask` (curled directly, confirmed HTTP 503 with that message) -- no live
+  Ollama request was made anywhere in this round, since Ollama isn't installed on this
+  machine.
+
+**Limitations added this round:**
+
+- The `ollama` backend has never actually been run against a real Ollama server on this
+  machine (Ollama isn't installed here) -- it's verified via `httpx.MockTransport` (real
+  request/response shapes, no network) and a real connection-refused error path, not a
+  real end-to-end generation. Anyone using it should expect to debug real-model quirks
+  (formatting, occasionally ignoring the "say so when the sections don't answer" rule)
+  that a mocked test can't catch.
+- `WEAK_MATCH_DISTANCE` is a single global cutoff tuned against this specific corpus and
+  embedding model; it would need recalibrating against real distances if the corpus,
+  embedding model, or domain changes.

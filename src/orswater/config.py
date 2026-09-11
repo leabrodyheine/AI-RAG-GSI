@@ -15,7 +15,14 @@ except ModuleNotFoundError:
 DEFAULT_DATABASE_URL = "postgresql://orswater:orswater@localhost:5432/orswater"
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_ANSWER_BACKEND = "deterministic"
-VALID_ANSWER_BACKENDS = {"deterministic", "anthropic"}
+VALID_ANSWER_BACKENDS = {"deterministic", "ollama", "anthropic"}
+
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+# llama3.2:3b: ~2GB download, runs on modest laptop hardware (CPU-only is fine), and
+# follows a system prompt's "cite section numbers, say so plainly when the sections don't
+# answer the question" instructions reliably enough for this prototype -- see README for
+# the tradeoff against the larger, paid, more reliable anthropic backend.
+DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
 
 # The value .env.example used to document before an empty ANTHROPIC_API_KEY= was made the
 # documented placeholder. A user's existing .env may still carry it -- treat it the same as
@@ -33,6 +40,8 @@ class Config:
     anthropic_api_key: str | None
     anthropic_model: str
     answer_backend: str
+    ollama_host: str
+    ollama_model: str
 
     @property
     def has_anthropic_credentials(self) -> bool:
@@ -52,4 +61,10 @@ def load_config() -> Config:
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY"),
         anthropic_model=os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL),
         answer_backend=answer_backend,
+        # Both have usable defaults (no separate "is Ollama configured" check the way
+        # ANTHROPIC_API_KEY needs one) -- reachability is only knowable by actually calling
+        # the server, so that failure surfaces at answer() time, not here. See
+        # OllamaUnavailableError.
+        ollama_host=os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST).rstrip("/"),
+        ollama_model=os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
     )
