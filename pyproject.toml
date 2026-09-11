@@ -17,7 +17,9 @@ dependencies = [
     "sentence-transformers>=3.0",
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",
-    "anthropic>=0.49",
+    # Verified: the >=0.49 floor was provisional. The search_result content-block and
+    # citations API this prototype uses is confirmed present, non-beta, in 1.5.0.
+    "anthropic>=1.5",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "python-dotenv>=1.0",

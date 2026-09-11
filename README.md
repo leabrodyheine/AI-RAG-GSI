@@ -26,6 +26,7 @@ Build a small, working RAG prototype that answers questions about Oregon water l
 - Don't log full prompts or retrieved text by default.
 - Claude gets no tools: no web access, no file writes. Read-only question answering.
 - API key comes from the `ANTHROPIC_API_KEY` env var; model from `ANTHROPIC_MODEL`, defaulting to `claude-sonnet-5`. Provide `.env.example`.
+- The answer step has two backends, chosen by `ANSWER_BACKEND` (default `deterministic`): `deterministic` needs no API key and makes no external call at all (a bounded verbatim excerpt of the top retrieved section); `anthropic` is opted into explicitly and sends retrieved sections to Claude. Having `ANTHROPIC_API_KEY` set never selects `anthropic` by itself.
 
 **Schema:** one `sections` table with section_number (unique, e.g. "537.130"), chapter, heading, text, source_url, edition (read from the page), allowed_groups (text array, empty = public), embedding (vector), and a generated tsvector column. Add an HNSW index on the embedding and a GIN index on the tsvector.
 
@@ -61,7 +62,7 @@ Requires Python 3.11+ and Docker.
 
 ```bash
 # 1. Config
-cp .env.example .env          # add your ANTHROPIC_API_KEY
+cp .env.example .env          # defaults to ANSWER_BACKEND=deterministic -- no API key needed
 
 # 2. Postgres + pgvector
 docker compose up -d          # starts Postgres on localhost:5432
@@ -77,17 +78,34 @@ python -m orswater.db         # applies sql/schema.sql, prints the pgvector vers
 Later milestones add: `python -m orswater.ingest` (fetch + parse + embed the ORS chapters),
 `orswater ask "..."` (answer a question), and `uvicorn orswater.web:app` (the web page).
 
+### Do I need an API key?
+
+No, not for most of this prototype. Ingestion, embeddings, retrieval (`search()`),
+retrieval evaluation (`scripts/eval_retrieval.py`), and the default `deterministic`
+answer backend all run entirely locally against Postgres — no `ANTHROPIC_API_KEY`
+required, no network call at answer time. Embeddings use `BAAI/bge-small-en-v1.5` via
+sentence-transformers, which also runs locally; its weights (~130 MB) are downloaded
+from Hugging Face the first time it's used and cached afterward, so the very first
+ingest or search does need network access for that one-time download, not for anything
+document-related.
+
+Set `ANSWER_BACKEND=anthropic` in `.env` only if you want natural-language cited answers
+from Claude instead of the deterministic backend's verbatim excerpt. That's opt-in,
+requires a real `ANTHROPIC_API_KEY` (from
+[console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)), and
+incurs Anthropic API usage costs.
+
 ### Layout
 
 | Path | Purpose |
 | --- | --- |
 | `sql/schema.sql` | the single `sections` table + HNSW and GIN indexes |
 | `docker-compose.yml` | Postgres 17 with the pgvector extension |
-| `src/orswater/config.py` | env config (`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `DATABASE_URL`) |
+| `src/orswater/config.py` | env config (`ANSWER_BACKEND`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `DATABASE_URL`) |
 | `src/orswater/db.py` | psycopg connection + schema setup |
 | `src/orswater/fetch.py` / `parse.py` / `embed.py` / `ingest.py` | ingestion pipeline (M2) |
 | `src/orswater/search.py` | `search(question, user_groups)` — the swappable retrieval seam (M3) |
-| `src/orswater/answer.py` | Claude call with search-result citations (M5) |
+| `src/orswater/answer.py` | `answer()` — deterministic (default, no API key) or Claude-with-citations backend, chosen by `ANSWER_BACKEND` (M5) |
 | `src/orswater/web.py` + `web/index.html` | FastAPI page (M6) |
 | `evals/` | retrieval evaluation set + report script (M4) |
 | `tests/` | parser and search unit tests |
