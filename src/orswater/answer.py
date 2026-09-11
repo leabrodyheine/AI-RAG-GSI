@@ -56,6 +56,17 @@ EXCERPT_MAX_CHARS = 700
 EXCERPT_EXTENSION_FACTOR = 1.3
 _SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 
+# Cosine distance above which the top retrieved section is considered too weak a semantic
+# match to quote as if it answers the question -- there's no LLM in the deterministic
+# backend to judge relevance, so this is the only signal it has. Calibrated against the 25
+# real evals/questions.jsonl questions (max distance among their real top-1 matches:
+# 0.328) and a handful of clearly off-topic questions ("What is the speed limit on I-5?":
+# 0.455; "What's a good recipe for banana bread?": 0.588), leaving margin on both sides.
+# It won't catch every off-topic question (a domain-adjacent one can still score low), and
+# doesn't apply to a direct ORS-citation match (Result.distance is None there -- an exact
+# citation is inherently a confident match).
+WEAK_MATCH_DISTANCE = 0.40
+
 
 class MissingAnthropicCredentialsError(RuntimeError):
     """ANSWER_BACKEND=anthropic was selected but no usable ANTHROPIC_API_KEY is set."""
@@ -96,8 +107,26 @@ def _bounded_excerpt(text: str, max_chars: int = EXCERPT_MAX_CHARS) -> str:
 def _deterministic_answer(retrieved: list[Result]) -> Answer:
     """No model, no API, no network call -- a bounded verbatim excerpt of the
     highest-ranked retrieved section, clearly labeled as a prototype retrieval result
-    rather than an AI-generated interpretation."""
+    rather than an AI-generated interpretation.
+
+    The only relevance signal available without an LLM is the top result's embedding
+    distance (search.py always attaches one except for a direct ORS-citation match, which
+    is exact by construction). When that distance is weak, quoting the section as if it
+    answers the question would be misleading, so this says plainly that nothing retrieved
+    looks like a close match instead -- see WEAK_MATCH_DISTANCE for how that cutoff was
+    chosen."""
     top = retrieved[0]
+
+    if top.distance is not None and top.distance > WEAK_MATCH_DISTANCE:
+        text = (
+            "[Deterministic prototype result]\n\n"
+            "None of the retrieved ORS sections look like a close match for this "
+            f"question (closest: ORS {top.section_number} — {top.heading}), so no excerpt "
+            "is being quoted as an answer. See the retrieved sections list in case one is "
+            f"still useful.\n\n{LEGAL_DISCLAIMER}"
+        )
+        return Answer(text=text, citations=[], retrieved_sections=retrieved, backend="deterministic")
+
     excerpt = _bounded_excerpt(top.text)
     text = (
         "[Deterministic prototype result -- a verbatim excerpt of the retrieved text, "

@@ -3,6 +3,20 @@ import type { FormEvent } from "react";
 import { ask } from "./api";
 import type { AskResponse } from "./types";
 
+// Matches orswater.answer.LEGAL_DISCLAIMER verbatim. The backend always includes it (the
+// README requires a visible "not legal advice" note, and the CLI still shows it) -- this
+// prototype's UI just doesn't display it. Stripping it here, rather than in the backend,
+// keeps the underlying answer text unchanged for any other caller.
+const LEGAL_DISCLAIMER = "This is general information, not legal advice.";
+
+function withoutDisclaimer(text: string): string {
+  return text
+    .split(LEGAL_DISCLAIMER)
+    .join("")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function App() {
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
@@ -29,7 +43,6 @@ function App() {
   return (
     <main className="app">
       <h1>Oregon Water Law Q&amp;A</h1>
-      <p className="disclaimer">This is general information, not legal advice.</p>
 
       <form className="question-form" onSubmit={handleSubmit}>
         <input
@@ -50,7 +63,7 @@ function App() {
         <section className="result">
           <span className={`backend-badge backend-${result.backend}`}>backend: {result.backend}</span>
 
-          <p className="answer-text">{result.text}</p>
+          <p className="answer-text">{withoutDisclaimer(result.text)}</p>
 
           {result.citations.length > 0 && (
             <div className="citations">

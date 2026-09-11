@@ -20,16 +20,6 @@ h1 {
   margin-bottom: 0.25rem;
 }
 
-.disclaimer {
-  color: #6b4a00;
-  background: #fff3cd;
-  border: 1px solid #e0c36a;
-  border-radius: 6px;
-  padding: 0.5rem 0.75rem;
-  font-size: 0.9rem;
-  display: inline-block;
-}
-
 .question-form {
   display: flex;
   gap: 0.5rem;

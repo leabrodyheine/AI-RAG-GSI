@@ -39,11 +39,17 @@ class Result:
     heading: str
     text: str
     url: str
+    # Cosine distance between the question embedding and this section's embedding (0 =
+    # identical, larger = less similar). None for a direct ORS-citation match, which is
+    # exact by construction and has no meaningful distance to compute.
+    distance: float | None = None
 
 
-def _row_to_result(row: tuple) -> Result:
+def _row_to_result(row: tuple, *, distance: float | None = None) -> Result:
     section_number, heading, text, source_url = row
-    return Result(section_number=section_number, heading=heading, text=text, url=source_url)
+    return Result(
+        section_number=section_number, heading=heading, text=text, url=source_url, distance=distance
+    )
 
 
 def _find_citation(question: str) -> str | None:
@@ -82,9 +88,10 @@ def _fts_search(conn: psycopg.Connection, question: str, user_groups: list[str])
     return [r[0] for r in rows]
 
 
-def _vector_search(conn: psycopg.Connection, question: str, user_groups: list[str]) -> list[str]:
+def _vector_search(
+    conn: psycopg.Connection, query_embedding: list[float], user_groups: list[str]
+) -> list[str]:
     """Return up to VECTOR_LIMIT section_numbers ranked by embedding cosine distance."""
-    query_embedding = embed_query(question)
     rows = conn.execute(
         f"""
         SELECT section_number
@@ -115,19 +122,27 @@ def _reciprocal_rank_fusion(ranked_lists: list[list[str]], *, k: int = RRF_K) ->
     return sorted(order, key=lambda key: scores[key], reverse=True)
 
 
-def _fetch_results(conn: psycopg.Connection, section_numbers: list[str], user_groups: list[str]) -> list[Result]:
-    """Fetch full rows for a list of section numbers, permission-filtered, preserving order."""
+def _fetch_results(
+    conn: psycopg.Connection,
+    section_numbers: list[str],
+    user_groups: list[str],
+    query_embedding: list[float],
+) -> list[Result]:
+    """Fetch full rows for a list of section numbers, permission-filtered, preserving order.
+    Each row's cosine distance to ``query_embedding`` is attached, regardless of whether it
+    was originally found by full-text or vector search -- a single, comparable relevance
+    signal callers (the deterministic answer backend) can use to judge match quality."""
     if not section_numbers:
         return []
     rows = conn.execute(
         f"""
-        SELECT section_number, heading, text, source_url
+        SELECT section_number, heading, text, source_url, embedding <=> %(embedding)s::vector AS distance
         FROM sections
         WHERE section_number = ANY(%(numbers)s) AND {_PERMISSION_SQL}
         """,
-        {"numbers": section_numbers, "user_groups": user_groups},
+        {"numbers": section_numbers, "user_groups": user_groups, "embedding": query_embedding},
     ).fetchall()
-    by_number = {r[0]: _row_to_result(r) for r in rows}
+    by_number = {r[0]: _row_to_result(r[:4], distance=r[4]) for r in rows}
     return [by_number[n] for n in section_numbers if n in by_number]
 
 
@@ -145,7 +160,8 @@ def search(conn: psycopg.Connection, question: str, user_groups: list[str]) -> l
         # Citation present but not visible/found (wrong chapter, excluded, or permission-
         # filtered) -- fall through to ordinary search rather than returning nothing.
 
+    query_embedding = embed_query(question)
     fts_ranked = _fts_search(conn, question, user_groups)
-    vector_ranked = _vector_search(conn, question, user_groups)
+    vector_ranked = _vector_search(conn, query_embedding, user_groups)
     merged = _reciprocal_rank_fusion([fts_ranked, vector_ranked])[:RESULT_LIMIT]
-    return _fetch_results(conn, merged, user_groups)
+    return _fetch_results(conn, merged, user_groups, query_embedding)

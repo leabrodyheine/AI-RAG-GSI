@@ -72,6 +72,16 @@ def test_unrecognized_question_falls_back_to_ranked_search(db_conn):
     results = search(db_conn, "Can I dig a well on my property without a permit?", user_groups=[])
     assert 0 < len(results) <= 8
     assert all(r.section_number for r in results)
+    # A relevance signal (used by the deterministic answer backend), not a filter here --
+    # search() itself still returns every ranked-search result regardless of distance.
+    assert all(isinstance(r.distance, float) for r in results)
+
+
+def test_citation_match_has_no_distance(db_conn):
+    # An exact ORS-citation match is confident by construction -- no embedding distance
+    # is computed for it, distinguishing it from a ranked-search result.
+    results = search(db_conn, "What does ORS 537.545 say about exempt uses?", user_groups=[])
+    assert results[0].distance is None
 
 
 # ---------------------------------------------------------------------------

@@ -16,8 +16,10 @@ from dataclasses import dataclass
 
 import pytest
 
+import orswater.answer as answer_module
 from orswater.answer import MissingAnthropicCredentialsError, answer
 from orswater.config import load_config
+from orswater.search import Result
 
 # ---------------------------------------------------------------------------
 # Fakes standing in for the anthropic SDK client
@@ -102,8 +104,6 @@ def test_deterministic_backend_never_constructs_an_anthropic_client(db_conn, mon
     monkeypatch.delenv("ANSWER_BACKEND", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    import orswater.answer as answer_module
-
     class _ExplodingAnthropic:
         def __init__(self, *args, **kwargs):
             raise AssertionError("deterministic backend must never construct anthropic.Anthropic")
@@ -156,6 +156,66 @@ def test_no_results_response_is_preserved_regardless_of_backend(db_conn, monkeyp
     assert result.citations == []
     assert result.retrieved_sections == []
     assert result.backend == "deterministic"
+
+
+def _fake_result(*, section_number="999.001", distance):
+    return Result(
+        section_number=section_number,
+        heading="A fabricated test heading",
+        text="A fabricated test body long enough to be a plausible excerpt.",
+        url="https://example.invalid/test",
+        distance=distance,
+    )
+
+
+def test_deterministic_backend_reports_no_confident_match_for_a_weak_semantic_match():
+    """Isolated from the DB and the real embedding model: a fabricated Result well past
+    WEAK_MATCH_DISTANCE must not be quoted as if it answers the question."""
+    weak = _fake_result(distance=answer_module.WEAK_MATCH_DISTANCE + 0.1)
+
+    result = answer_module._deterministic_answer([weak])
+
+    assert result.backend == "deterministic"
+    assert result.citations == []
+    assert result.retrieved_sections == [weak]  # still surfaced for transparency
+    assert "no excerpt is being quoted" in result.text.lower()
+    assert "not legal advice" in result.text.lower()
+
+
+def test_deterministic_backend_quotes_a_strong_semantic_match():
+    strong = _fake_result(distance=answer_module.WEAK_MATCH_DISTANCE - 0.1)
+
+    result = answer_module._deterministic_answer([strong])
+
+    assert len(result.citations) == 1
+    assert result.citations[0].section_number == strong.section_number
+
+
+def test_deterministic_backend_always_quotes_a_direct_citation_match_regardless_of_distance():
+    # search() sets distance=None for a direct ORS-citation hit -- always treated as a
+    # confident match, not run through the weak-match check at all.
+    exact = _fake_result(distance=None)
+
+    result = answer_module._deterministic_answer([exact])
+
+    assert len(result.citations) == 1
+
+
+def test_deterministic_backend_reports_no_confident_match_for_a_real_off_topic_question(
+    db_conn, monkeypatch
+):
+    """End-to-end with the real embedding model and the real corpus: a question the ORS
+    water-law chapters have nothing to do with should not come back quoting some
+    unrelated section as if it were the answer."""
+    monkeypatch.delenv("ANSWER_BACKEND", raising=False)
+
+    result = answer(db_conn, "What is the speed limit on I-5?", [])
+
+    assert result.backend == "deterministic"
+    assert result.citations == []
+    assert "no excerpt is being quoted" in result.text.lower()
+    assert "not legal advice" in result.text.lower()
+    assert len(result.retrieved_sections) >= 1  # still surfaced, just not cited as an answer
 
 
 # ---------------------------------------------------------------------------
