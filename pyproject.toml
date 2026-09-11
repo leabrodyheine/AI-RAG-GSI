@@ -9,8 +9,11 @@ description = "RAG prototype answering Oregon water law questions from the Orego
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
-    "beautifulsoup4>=4.12",
-    "lxml>=5.2",
+    "beautifulsoup4>=4.13",
+    # Verified: lxml 5.2's libxml2 silently drops some malformed paragraphs in the
+    # real ORS chapter 537 page (undercounts by ~1100 of 2707 <p> tags); 6.1
+    # parses it completely. Pin the floor to the version actually verified against.
+    "lxml>=6.1",
     "sentence-transformers>=3.0",
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",
