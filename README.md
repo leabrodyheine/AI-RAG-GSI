@@ -76,7 +76,19 @@ python -m orswater.db         # applies sql/schema.sql, prints the pgvector vers
 ```
 
 Later milestones add: `python -m orswater.ingest` (fetch + parse + embed the ORS chapters),
-`orswater ask "..."` (answer a question), and `uvicorn orswater.web:app` (the web page).
+`orswater ask "..."` (answer a question), and the web page:
+
+```bash
+# One-time: build the React frontend (needs Node.js; static output only, no Node at runtime)
+cd web && npm install && npm run build && cd ..
+
+# Serve the API + built frontend together
+uvicorn orswater.web:app --port 8000       # open http://localhost:8000
+```
+
+For frontend development instead of a rebuild-per-change loop, run `npm run dev` in `web/`
+(Vite dev server on :5173, proxying `/api` to `uvicorn orswater.web:app --port 8000` running
+separately) rather than the build step above.
 
 ### Do I need an API key?
 
@@ -106,9 +118,71 @@ incurs Anthropic API usage costs.
 | `src/orswater/fetch.py` / `parse.py` / `embed.py` / `ingest.py` | ingestion pipeline (M2) |
 | `src/orswater/search.py` | `search(question, user_groups)` — the swappable retrieval seam (M3) |
 | `src/orswater/answer.py` | `answer()` — deterministic (default, no API key) or Claude-with-citations backend, chosen by `ANSWER_BACKEND` (M5) |
-| `src/orswater/web.py` + `web/index.html` | FastAPI page (M6) |
+| `src/orswater/web.py` | FastAPI JSON API (`POST /api/ask`), serves the built frontend as static files (M6) |
+| `web/` | React + TypeScript frontend (Vite), built separately -- `web/src/App.tsx` (markup/logic), `web/src/App.css` (styles), `web/src/api.ts` + `web/src/types.ts` (typed API client) (M6) |
 | `evals/` | retrieval evaluation set + report script (M4) |
 | `tests/` | parser and search unit tests |
 
 Nothing document-derived leaves the machine except the section text sent to Claude at
 answer time; embeddings are computed locally and no tracing/telemetry services are used.
+
+## Final summary (Milestone 6)
+
+**What was built.** A FastAPI JSON API (`src/orswater/web.py`, one route:
+`POST /api/ask`) in front of the same `answer()` used by the CLI, so the web page and
+`orswater ask` share identical retrieval, permission filtering, and backend selection.
+The frontend is a separate React + TypeScript project (`web/`, built with Vite): a
+question box, the answer text with the backend that produced it labeled (`backend-badge`),
+a clickable "Cited sections" list (links to the ORS chapter page, quoting the exact cited
+text), a "Retrieved sections" list (the full "find documents" set, each linking to its
+source page), and a persistent "general information, not legal advice" notice. HTML
+(`web/index.html`), CSS (`web/src/App.css`), and TS/TSX (`web/src/*.tsx`/`.ts`) are kept in
+separate files, per instruction, rather than one static page. `web/dist` (the build output)
+is what `web.py` serves as static files; it's gitignored, same as `web/node_modules`.
+
+**Key decisions.**
+
+- One API route, matching the README's scope ("a FastAPI endpoint plus one static HTML
+  page") -- no auth, sessions, or extra endpoints not asked for.
+- `Citation` objects don't carry a URL (the CLI has no use for one), so `web.py` joins
+  each citation to its `retrieved_sections` entry by `section_number` to attach one for
+  "clickable citations," rather than changing the shared `answer.py` data model.
+- The React dev server proxies `/api` to the FastAPI app (`web/vite.config.ts`) instead of
+  adding CORS middleware -- one fewer moving part for a same-origin production setup.
+- `ANSWER_BACKEND=anthropic` without a real key returns HTTP 503 with the same
+  `MissingAnthropicCredentialsError` message the CLI prints, rather than a 200 with an
+  error string in the answer body.
+
+**Checks actually run:**
+
+- `pytest`: **42/42 passed** (4 new in `tests/test_web.py`, covering a real deterministic
+  answer through the live API with citation URL, an empty-corpus 200 with the no-results
+  text -- via the shared test DB connection, never committed, so the real 412-row corpus
+  was untouched and reconfirmed by count afterward -- and a 503 with no Anthropic key).
+- `ruff check .`: **all checks passed**.
+- `python -m py_compile` on `src/orswater/web.py` and `tests/test_web.py`: clean.
+- Frontend: `cd web && npm install && npm run build` -- `tsc --noEmit` (strict mode) and
+  the Vite production build both **succeeded** (144.79 kB JS / 1.63 kB CSS, gzipped
+  46.67 kB / 0.70 kB).
+- Live, end-to-end, by hand: started `uvicorn orswater.web:app --port 8000`, confirmed
+  `GET /` serves the built React `index.html`, then `POST /api/ask` for both a real
+  question (ORS 537.545, deterministic backend, citation URL correct) and one the
+  statutes don't answer well (returns the closest retrieved sections rather than
+  fabricating an answer). No live Anthropic request was made -- `ANSWER_BACKEND` stayed at
+  its `deterministic` default throughout.
+
+**Limitations.**
+
+- No automated browser/UI test (no headless-browser tooling in this environment) -- the
+  frontend was verified by a real `npm run build` plus manual `curl` calls against the
+  running API, not by rendering it in an actual browser.
+- `npm audit` flags a moderate advisory in Vite's dev-only `esbuild` dependency (a
+  malicious site could probe the local Vite **dev server**, not the production build or
+  the FastAPI app); left as-is rather than force-upgrading Vite to a breaking major
+  version for a prototype.
+- The React app has no build step wired into CI/tests -- `npm run build` must be run
+  manually before `uvicorn orswater.web:app` has anything to serve at `/`; without it, `/`
+  returns a plain instruction message instead of failing.
+- Inline citation highlighting within the answer text itself wasn't built; citations are
+  shown as a separate list under the answer rather than as inline markers, which keeps the
+  UI simple but doesn't visually tie a specific sentence in the answer to its source.

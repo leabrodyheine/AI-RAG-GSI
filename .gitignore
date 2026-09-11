@@ -18,3 +18,7 @@ dist/
 # Local model weights / HF cache
 models/
 .hf_cache/
+
+# Frontend (Milestone 6) -- built assets and installed packages, not source
+web/node_modules/
+web/dist/
