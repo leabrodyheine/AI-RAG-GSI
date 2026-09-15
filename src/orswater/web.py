@@ -16,7 +16,7 @@ import pathlib
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .answer import MissingAnthropicCredentialsError, OllamaUnavailableError, answer
 from .db import connect
@@ -26,7 +26,7 @@ app = FastAPI(title="Oregon Water Law RAG")
 
 class AskRequest(BaseModel):
     question: str
-    groups: list[str] = []
+    groups: list[str] = Field(default_factory=list)
 
 
 class CitationOut(BaseModel):
